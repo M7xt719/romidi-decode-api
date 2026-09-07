@@ -19,7 +19,7 @@ Pipeline (RAM stays flat regardless of file size):
 Output files in out_dir:
   sched.bin    — the packed schedule: N * 9-byte records (romidi-sched-v1)
   index.bin    — chunkCount * u32 little-endian: first start_ms of each chunk
-  header.json  — {format,noteCount,durationMs,trackCount,recordBytes,notesPerChunk,chunkCount,code}
+  header.json  — {format,noteCount,durationMs,trackCount,recordBytes,notesPerChunk,chunkCount,code,trackNames,trackNotes}
 
 sched.bin is the SAME 9-byte record format the game already reads, so a "chunk"
 is just sched.bin[i*notesPerChunk*9 : (i+1)*notesPerChunk*9].
@@ -113,6 +113,8 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
         note_total = 0
         last_prog = 0
         track_index = -1
+        track_names = {}   # track_index -> name (from FF 03 meta)
+        track_notes = {}   # track byte (0..255) -> note count
 
         pos = 0
         while pos + 8 <= n:
@@ -146,6 +148,13 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
                             tempo_ticks.append(abs_tick)
                             tempo_vals.append((mv[p] << 16) | (mv[p + 1] << 8) | mv[p + 2])
                             p += length2
+                        elif mtype == 0x03:
+                            seg = bytes(mv[p:p + length2])
+                            p += length2
+                            if track_index not in track_names:
+                                nm = seg.decode("utf-8", "ignore").replace("\x00", "").strip()
+                                if nm:
+                                    track_names[track_index] = nm[:48]
                         elif mtype == 0x2F:
                             p += length2
                             break
@@ -174,6 +183,7 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
                             buckets.write(onv[0] // bucket_ticks,
                                           pack(onv[0], abs_tick, note & 0x7F, tclamp, onv[1] if onv[1] <= 127 else 127))
                             note_total += 1
+                            track_notes[tclamp] = track_notes.get(tclamp, 0) + 1
                 elif hi == 0x80:
                     note = mv[p]; p += 2
                     onv = active.pop((chan, note), None)
@@ -181,6 +191,7 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
                         buckets.write(onv[0] // bucket_ticks,
                                       pack(onv[0], abs_tick, note & 0x7F, tclamp, onv[1] if onv[1] <= 127 else 127))
                         note_total += 1
+                        track_notes[tclamp] = track_notes.get(tclamp, 0) + 1
                 elif hi == 0xA0 or hi == 0xB0 or hi == 0xE0:
                     p += 2
                 else:
@@ -196,6 +207,7 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
                     buckets.write(start_tick // bucket_ticks,
                                   pack(start_tick, abs_tick, note & 0x7F, tclamp, vel if vel <= 127 else 127))
                     note_total += 1
+                    track_notes[tclamp] = track_notes.get(tclamp, 0) + 1
         buckets.close()
     finally:
         mv.release()
@@ -251,11 +263,15 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
                     index[i] = struct.unpack("<I", b4)[0]
     index.tofile(os.path.join(out_dir, "index.bin"))
 
+    _ntr = min(track_count, 512)
+    track_names_list = [track_names.get(i, "") for i in range(_ntr)]
+    track_notes_list = [int(track_notes.get(i, 0)) for i in range(_ntr)]
     header = {
         "format": FORMAT, "noteCount": note_total,
         "durationMs": int(max_end_s * 1000 + 0.5),
         "trackCount": track_count, "recordBytes": REC_BYTES,
         "notesPerChunk": DEFAULT_NOTES_PER_CHUNK, "chunkCount": chunk_count, "code": code,
+        "trackNames": track_names_list, "trackNotes": track_notes_list,
     }
     with open(os.path.join(out_dir, "header.json"), "w") as f:
         json.dump(header, f)
