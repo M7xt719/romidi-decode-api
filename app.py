@@ -3,32 +3,42 @@ Ro-MIDI streaming decode API  (v2 — windowed / disk-backed)
 
 Turns any-size .mid into an on-disk, globally sorted, chunk-indexed schedule and
 serves it to the game one time-window at a time, so massive black MIDIs (up to
-hundreds of millions of notes) can be streamed without ever holding the whole
-song in memory — on the server OR in Roblox.
+BILLIONS of notes) can be streamed without ever holding the whole song in memory
+— on the server OR in Roblox.
 
 Big files are parsed ONCE in a background process and cached by their content
 "code" (sha1 of the file). The game polls /decode until status == "ready", then
 fetches /index once and pulls /chunk/<code>/<i> on demand as the playhead moves.
 
+ZIP "folders": /decode also accepts a link to a .zip. The server unzips it and
+finds the .mid/.midi inside. One MIDI -> it just decodes that one. SEVERAL MIDIs
+-> it replies status == "choices" with the list of names, so the game can ask
+which one; the game re-calls /decode with &pick=<index> to extract that one.
+
 Endpoints (all the game needs are GETs, each response well under Roblox's ~1 MB):
   GET  /                       -> service info
   GET  /health                 -> {"ok": true}
   GET  /decode?url=<mid-url>    -> START (or poll) an async build; returns {status,...}
-  POST /decode                 -> body {"url": "..."} OR multipart file "file"
+  GET  /decode?url=<zip>&pick=N -> extract MIDI #N (0-based) from a zip folder
+  POST /decode                 -> body {"url": "..."} OR multipart file "file" (.mid or .zip)
   GET  /status/<job>           -> job status by job id (alt to polling /decode)
   GET  /header/<code>          -> the cached header JSON (incl. chunkCount)
   GET  /index/<code>           -> raw u32[chunkCount] little-endian: first start_ms of each chunk
   GET  /chunk/<code>/<i>       -> raw bytes of chunk i (application/octet-stream)
 
 Status values: starting -> downloading -> queued -> parsing -> assembling -> ready
-(or error). "code" appears once the download is hashed; the full header once ready.
+(or error, or choices). "code" appears once the source is hashed; the full header
+once ready; "choices" carries a list of MIDI names when a zip holds more than one.
 """
 
 import os
 import re
+import io
 import sys
 import json
 import time
+import shutil
+import zipfile
 import hashlib
 import threading
 import subprocess
@@ -95,6 +105,58 @@ def _get_job(jk):
         return dict(_JOBS.get(jk) or {})
 
 
+def _sha1_file(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for part in iter(lambda: f.read(1 << 20), b""):
+            h.update(part)
+    return h.hexdigest()
+
+
+_ZIP_SIGS = (b"\x03\x04", b"\x05\x06", b"\x07\x08")
+
+
+def _is_zip(path):
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(4)
+        return sig[:2] == b"PK" and sig[2:4] in _ZIP_SIGS
+    except OSError:
+        return False
+
+
+def _zip_midi_names(names_source):
+    """Sorted list of the .mid/.midi entries in a zipfile.ZipFile, skipping dirs and mac junk."""
+    out = []
+    for info in names_source.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        base = name.rsplit("/", 1)[-1]
+        if not base or base.startswith("._") or name.startswith("__MACOSX/") or "/__MACOSX/" in name:
+            continue
+        if base.lower().endswith((".mid", ".midi")):
+            out.append(name)
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+def _resolve_pick(names, pick):
+    """pick may be a 0-based index (as str/int) or a filename; returns the matching entry or None."""
+    if pick is None:
+        return None
+    s = str(pick).strip()
+    if s == "":
+        return None
+    if s.isdigit():
+        idx = int(s)
+        return names[idx] if 0 <= idx < len(names) else None
+    for n in names:
+        if n == s or n.rsplit("/", 1)[-1] == s:
+            return n
+    return None
+
+
 def _download(url, dst, jk):
     if not re.match(r"^https?://", url, re.I):
         raise ValueError("url must be http(s)")
@@ -109,7 +171,7 @@ def _download(url, dst, jk):
                     continue
                 total += len(part)
                 if total > MAX_DOWNLOAD_BYTES:
-                    raise ValueError("source MIDI exceeds the %d-byte download limit" % MAX_DOWNLOAD_BYTES)
+                    raise ValueError("source exceeds the %d-byte download limit" % MAX_DOWNLOAD_BYTES)
                 h.update(part)
                 f.write(part)
                 _set_job(jk, status="downloading", bytes=total)
@@ -118,12 +180,58 @@ def _download(url, dst, jk):
     return h.hexdigest()[:8].upper()
 
 
-def _run_job(jk, url):
-    tmp = os.path.join(TMP_DIR, jk + ".mid")
+def _run_job(jk, url, pick=None):
+    url_jk = _jobkey(url)                              # zip cache is keyed by URL (shared across picks)
+    tmp = os.path.join(TMP_DIR, jk + ".src")           # the raw download (mid OR zip)
+    midtmp = os.path.join(TMP_DIR, jk + ".mid")        # a MIDI extracted from a zip
+    zip_cache = os.path.join(TMP_DIR, url_jk + ".zipsrc")  # kept between the "choices" reply and the pick
+    keep_zip = False
     try:
-        _set_job(jk, status="downloading", bytes=0)
-        code = _download(url, tmp, jk)
-        _set_job(jk, status="queued", code=code)
+        # get the source bytes — reuse a cached zip on a follow-up pick so we don't re-download it
+        if pick is not None and os.path.exists(zip_cache):
+            src_path, dl_code = zip_cache, None
+        else:
+            _set_job(jk, status="downloading", bytes=0)
+            dl_code = _download(url, tmp, jk)
+            src_path = tmp
+
+        if _is_zip(src_path):
+            # a "folder" of MIDIs — find them
+            try:
+                with zipfile.ZipFile(src_path) as z:
+                    names = _zip_midi_names(z)
+            except zipfile.BadZipFile:
+                raise RuntimeError("that .zip is corrupt or not a real zip")
+            if not names:
+                raise RuntimeError("that zip has no .mid or .midi files in it")
+            # keep the zip so a follow-up &pick doesn't have to download it again
+            if src_path != zip_cache:
+                try:
+                    shutil.copyfile(src_path, zip_cache)
+                except OSError:
+                    pass
+            chosen = _resolve_pick(names, pick)
+            if chosen is None:
+                if pick is not None and str(pick).strip() != "":
+                    raise RuntimeError("that MIDI is not in the zip — reload the folder and pick again")
+                if len(names) == 1:
+                    chosen = names[0]                  # only one inside → just use it
+                else:
+                    bases = [n.rsplit("/", 1)[-1] for n in names]   # ask the game which one
+                    _set_job(jk, status="choices", choices=bases, choiceCount=len(bases))
+                    keep_zip = True
+                    return
+            with zipfile.ZipFile(zip_cache if os.path.exists(zip_cache) else src_path) as z:
+                data = z.read(chosen)
+            with open(midtmp, "wb") as f:
+                f.write(data)
+            build_src = midtmp
+            code = _sha1_file(build_src)[:8].upper()
+            _set_job(jk, status="queued", code=code, pickedName=chosen.rsplit("/", 1)[-1])
+        else:
+            build_src = src_path                        # a plain .mid
+            code = dl_code or _sha1_file(build_src)[:8].upper()
+            _set_job(jk, status="queued", code=code)
 
         with _BUILD_LOCK:
             hdr = _load_header(code)
@@ -132,7 +240,7 @@ def _run_job(jk, url):
                 os.makedirs(out_dir, exist_ok=True)
                 _set_job(jk, status="parsing", code=code, noteCount=0)
                 proc = subprocess.Popen(
-                    [sys.executable, os.path.join(APP_DIR, "build_worker.py"), tmp, out_dir, code],
+                    [sys.executable, os.path.join(APP_DIR, "build_worker.py"), build_src, out_dir, code],
                     cwd=APP_DIR,
                 )
                 pf = os.path.join(out_dir, "progress.json")
@@ -168,10 +276,16 @@ def _run_job(jk, url):
     except Exception as e:  # noqa: BLE001
         _set_job(jk, status="error", err=str(e))
     finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        for p in (tmp, midtmp):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if not keep_zip:                                # only drop the zip once we're past the pick
+            try:
+                os.remove(zip_cache)
+            except OSError:
+                pass
 
 
 def _ready_payload(code):
@@ -183,11 +297,31 @@ def _ready_payload(code):
 @app.route("/decode", methods=["GET", "POST"])
 def decode():
     # multipart upload (e.g. RAMP) — build synchronously (uploads are the user's own,
-    # usually modest; still cached by code).
+    # usually modest; still cached by code). A .zip upload is unpacked the same way.
     if request.method == "POST" and request.files.get("file"):
         data = request.files["file"].read()
         if not data:
             abort(400, "empty file")
+        pick = request.form.get("pick")
+        if data[:2] == b"PK" and data[2:4] in _ZIP_SIGS:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    names = _zip_midi_names(z)
+                    if not names:
+                        abort(400, "that zip has no .mid or .midi files in it")
+                    chosen = _resolve_pick(names, pick)
+                    if chosen is None:
+                        if pick is not None and str(pick).strip() != "":
+                            abort(400, "picked MIDI is not in the zip")
+                        if len(names) == 1:
+                            chosen = names[0]
+                        else:
+                            return jsonify({"ok": True, "status": "choices",
+                                            "choices": [n.rsplit("/", 1)[-1] for n in names],
+                                            "choiceCount": len(names)})
+                    data = z.read(chosen)
+            except zipfile.BadZipFile:
+                abort(400, "that .zip is corrupt or not a real zip")
         code = hashlib.sha1(data).hexdigest()[:8].upper()
         if _load_header(code) is None:
             tmp = os.path.join(TMP_DIR, code + ".upload.mid")
@@ -206,13 +340,24 @@ def decode():
 
     url = request.args.get("url") or (request.is_json and (request.get_json(silent=True) or {}).get("url"))
     if not url:
-        abort(400, "provide ?url=<mid>, a JSON body {\"url\":...}, or a multipart 'file'")
+        abort(400, "provide ?url=<mid|zip>, a JSON body {\"url\":...}, or a multipart 'file'")
     url = url.strip()
-    jk = _jobkey(url)
+
+    pick = request.args.get("pick")
+    if pick is None and request.is_json:
+        pick = (request.get_json(silent=True) or {}).get("pick")
+    if pick is not None and str(pick).strip() == "":
+        pick = None
+    # a pick is its own job (same zip, different chosen MIDI) so it never collides with the choices job
+    jk = _jobkey(url + ("\x00PICK\x00" + str(pick) if pick is not None else ""))
     j = _get_job(jk)
 
     if j.get("status") == "ready" and _load_header(j.get("code")):
         return jsonify(_ready_payload(j["code"]))
+
+    if j.get("status") == "choices":
+        return jsonify({"ok": True, "status": "choices", "job": jk,
+                        "choices": j.get("choices", []), "choiceCount": j.get("choiceCount", 0)})
 
     # resume a cached result by URL after a restart (in-memory job map is gone,
     # but the store on the persistent disk isn't)
@@ -240,7 +385,7 @@ def decode():
         pass
 
     _set_job(jk, status="starting", bytes=0, noteCount=0)
-    threading.Thread(target=_run_job, args=(jk, url), daemon=True).start()
+    threading.Thread(target=_run_job, args=(jk, url, pick), daemon=True).start()
     return jsonify({"ok": True, "status": "starting", "job": jk})
 
 
@@ -253,6 +398,9 @@ def status(job):
            "noteCount": j.get("noteCount", 0)}
     if j.get("code"):
         out["code"] = j["code"]
+    if j.get("status") == "choices":
+        out["choices"] = j.get("choices", [])
+        out["choiceCount"] = j.get("choiceCount", 0)
     if j.get("status") == "ready":
         out.update(_load_header(j["code"]) or {})
     if j.get("status") == "error":
@@ -305,7 +453,7 @@ def info():
     return jsonify({
         "service": "Ro-MIDI streaming decode API",
         "format": decoder.FORMAT,
-        "flow": "GET /decode?url=<mid> (poll until status=ready) -> GET /index/<code> -> GET /chunk/<code>/<i>",
+        "flow": "GET /decode?url=<mid|zip> (poll until status=ready; a multi-MIDI zip returns status=choices — re-call with &pick=<index>) -> GET /index/<code> -> GET /chunk/<code>/<i>",
     })
 
 
