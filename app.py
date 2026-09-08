@@ -10,17 +10,20 @@ Big files are parsed ONCE in a background process and cached by their content
 "code" (sha1 of the file). The game polls /decode until status == "ready", then
 fetches /index once and pulls /chunk/<code>/<i> on demand as the playhead moves.
 
-ZIP "folders": /decode also accepts a link to a .zip. The server unzips it and
-finds the .mid/.midi inside. One MIDI -> it just decodes that one. SEVERAL MIDIs
--> it replies status == "choices" with the list of names, so the game can ask
-which one; the game re-calls /decode with &pick=<index> to extract that one.
+ARCHIVE "folders": /decode also accepts a link to an archive of MIDIs —
+  .zip · .tar/.tar.gz/.tgz/.tar.bz2/.tar.xz · .7z · .rar
+The server opens it and finds the .mid/.midi inside. ONE MIDI -> it just decodes
+that one. SEVERAL -> it replies status == "choices" with the list of names so the
+game can ask which one; the game re-calls /decode with &pick=<index> to pull it.
+(.zip and .tar* work everywhere; .7z needs the py7zr package; .rar needs an
+extractor binary — 'unar' — installed in the image. See requirements/Dockerfile.)
 
 Endpoints (all the game needs are GETs, each response well under Roblox's ~1 MB):
   GET  /                       -> service info
   GET  /health                 -> {"ok": true}
   GET  /decode?url=<mid-url>    -> START (or poll) an async build; returns {status,...}
-  GET  /decode?url=<zip>&pick=N -> extract MIDI #N (0-based) from a zip folder
-  POST /decode                 -> body {"url": "..."} OR multipart file "file" (.mid or .zip)
+  GET  /decode?url=<arc>&pick=N -> extract MIDI #N (0-based) from an archive folder
+  POST /decode                 -> body {"url": "..."} OR multipart file "file" (.mid or an archive)
   GET  /status/<job>           -> job status by job id (alt to polling /decode)
   GET  /header/<code>          -> the cached header JSON (incl. chunkCount)
   GET  /index/<code>           -> raw u32[chunkCount] little-endian: first start_ms of each chunk
@@ -28,7 +31,7 @@ Endpoints (all the game needs are GETs, each response well under Roblox's ~1 MB)
 
 Status values: starting -> downloading -> queued -> parsing -> assembling -> ready
 (or error, or choices). "code" appears once the source is hashed; the full header
-once ready; "choices" carries a list of MIDI names when a zip holds more than one.
+once ready; "choices" carries a list of MIDI names when an archive holds >1.
 """
 
 import os
@@ -39,6 +42,7 @@ import json
 import time
 import shutil
 import zipfile
+import tarfile
 import hashlib
 import threading
 import subprocess
@@ -113,32 +117,117 @@ def _sha1_file(path):
     return h.hexdigest()
 
 
+# ── archive support (zip · tar* · 7z · rar) ──────────────────────────
 _ZIP_SIGS = (b"\x03\x04", b"\x05\x06", b"\x07\x08")
 
 
-def _is_zip(path):
+def _archive_kind_bytes(head):
+    """Classify an archive from its first bytes: 'zip' | 'rar' | '7z' | 'tar' | None."""
+    if head[:2] == b"PK" and head[2:4] in _ZIP_SIGS:
+        return "zip"
+    if head[:4] == b"Rar!":                       # Rar!\x1a\x07\x00 (v4) / \x01\x00 (v5)
+        return "rar"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    if head[:2] == b"\x1f\x8b":                   # gzip → treat as .tar.gz (tarfile r:* auto-detects)
+        return "tar"
+    if head[:3] == b"BZh":                        # bzip2 → .tar.bz2
+        return "tar"
+    if head[:6] == b"\xfd7zXZ\x00":               # xz → .tar.xz
+        return "tar"
+    if len(head) >= 262 and head[257:262] == b"ustar":   # plain tar
+        return "tar"
+    return None
+
+
+def _archive_kind(path):
     try:
         with open(path, "rb") as f:
-            sig = f.read(4)
-        return sig[:2] == b"PK" and sig[2:4] in _ZIP_SIGS
+            head = f.read(264)
     except OSError:
+        return None
+    return _archive_kind_bytes(head)
+
+
+def _keep_midi(name):
+    base = name.rsplit("/", 1)[-1]
+    if not base or base.startswith("._"):
         return False
+    if name.startswith("__MACOSX/") or "/__MACOSX/" in name:
+        return False
+    return base.lower().endswith((".mid", ".midi"))
 
 
-def _zip_midi_names(names_source):
-    """Sorted list of the .mid/.midi entries in a zipfile.ZipFile, skipping dirs and mac junk."""
-    out = []
-    for info in names_source.infolist():
-        if info.is_dir():
-            continue
-        name = info.filename
-        base = name.rsplit("/", 1)[-1]
-        if not base or base.startswith("._") or name.startswith("__MACOSX/") or "/__MACOSX/" in name:
-            continue
-        if base.lower().endswith((".mid", ".midi")):
-            out.append(name)
-    out.sort(key=lambda s: s.lower())
+def _sorted_midis(names):
+    out = [n for n in names if _keep_midi(n)]
+    out.sort(key=str.lower)
     return out
+
+
+def _open_rar(path):
+    try:
+        import rarfile
+    except ImportError:
+        raise RuntimeError(".rar support isn't installed on this server build (add 'rarfile' + 'unar')")
+    try:
+        rarfile.tool_setup()   # probes for unrar/unar/bsdtar/7z; raises if none present
+    except Exception:
+        raise RuntimeError(".rar needs an extractor on the server — install 'unar' in the Docker image")
+    try:
+        return rarfile.RarFile(path)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("couldn't open that .rar (%s)" % e.__class__.__name__)
+
+
+def _archive_list_midis(path):
+    """Sorted list of the .mid/.midi entries in the archive at `path`, or None if it isn't one."""
+    kind = _archive_kind(path)
+    if kind == "zip":
+        with zipfile.ZipFile(path) as z:
+            return _sorted_midis(i.filename for i in z.infolist() if not i.is_dir())
+    if kind == "tar":
+        try:
+            with tarfile.open(path, "r:*") as t:
+                return _sorted_midis(m.name for m in t.getmembers() if m.isfile())
+        except tarfile.TarError as e:
+            raise RuntimeError("couldn't read that tar archive (%s)" % e.__class__.__name__)
+    if kind == "7z":
+        try:
+            import py7zr
+        except ImportError:
+            raise RuntimeError(".7z support isn't installed on this server build (add 'py7zr')")
+        with py7zr.SevenZipFile(path, "r") as a:
+            return _sorted_midis(fi.filename for fi in a.list() if not fi.is_directory)
+    if kind == "rar":
+        rf = _open_rar(path)
+        return _sorted_midis(i.filename for i in rf.infolist() if not i.isdir())
+    return None
+
+
+def _archive_read(path, name):
+    """Bytes of one entry `name` from the archive at `path`."""
+    kind = _archive_kind(path)
+    if kind == "zip":
+        with zipfile.ZipFile(path) as z:
+            return z.read(name)
+    if kind == "tar":
+        with tarfile.open(path, "r:*") as t:
+            f = t.extractfile(name)
+            if f is None:
+                raise RuntimeError("couldn't extract '%s' from the tar" % name)
+            return f.read()
+    if kind == "7z":
+        import py7zr
+        with py7zr.SevenZipFile(path, "r") as a:
+            got = a.read([name])
+            bio = got.get(name)
+            if bio is None:
+                raise RuntimeError("couldn't extract '%s' from the 7z" % name)
+            return bio.read()
+    if kind == "rar":
+        rf = _open_rar(path)
+        return rf.read(name)
+    raise RuntimeError("not a recognised archive")
 
 
 def _resolve_pick(names, pick):
@@ -181,48 +270,44 @@ def _download(url, dst, jk):
 
 
 def _run_job(jk, url, pick=None):
-    url_jk = _jobkey(url)                              # zip cache is keyed by URL (shared across picks)
-    tmp = os.path.join(TMP_DIR, jk + ".src")           # the raw download (mid OR zip)
-    midtmp = os.path.join(TMP_DIR, jk + ".mid")        # a MIDI extracted from a zip
-    zip_cache = os.path.join(TMP_DIR, url_jk + ".zipsrc")  # kept between the "choices" reply and the pick
-    keep_zip = False
+    url_jk = _jobkey(url)                              # archive cache is keyed by URL (shared across picks)
+    tmp = os.path.join(TMP_DIR, jk + ".src")           # the raw download (mid OR archive)
+    midtmp = os.path.join(TMP_DIR, jk + ".mid")        # a MIDI extracted from an archive
+    arc_cache = os.path.join(TMP_DIR, url_jk + ".arcsrc")  # kept between the "choices" reply and the pick
+    keep_arc = False
     try:
-        # get the source bytes — reuse a cached zip on a follow-up pick so we don't re-download it
-        if pick is not None and os.path.exists(zip_cache):
-            src_path, dl_code = zip_cache, None
+        # get the source bytes — reuse a cached archive on a follow-up pick so we don't re-download it
+        if pick is not None and os.path.exists(arc_cache):
+            src_path, dl_code = arc_cache, None
         else:
             _set_job(jk, status="downloading", bytes=0)
             dl_code = _download(url, tmp, jk)
             src_path = tmp
 
-        if _is_zip(src_path):
+        kind = _archive_kind(src_path)
+        if kind:
             # a "folder" of MIDIs — find them
-            try:
-                with zipfile.ZipFile(src_path) as z:
-                    names = _zip_midi_names(z)
-            except zipfile.BadZipFile:
-                raise RuntimeError("that .zip is corrupt or not a real zip")
+            names = _archive_list_midis(src_path)
             if not names:
-                raise RuntimeError("that zip has no .mid or .midi files in it")
-            # keep the zip so a follow-up &pick doesn't have to download it again
-            if src_path != zip_cache:
+                raise RuntimeError("that %s has no .mid or .midi files in it" % kind)
+            # keep the archive so a follow-up &pick doesn't have to download it again
+            if src_path != arc_cache:
                 try:
-                    shutil.copyfile(src_path, zip_cache)
+                    shutil.copyfile(src_path, arc_cache)
                 except OSError:
                     pass
             chosen = _resolve_pick(names, pick)
             if chosen is None:
                 if pick is not None and str(pick).strip() != "":
-                    raise RuntimeError("that MIDI is not in the zip — reload the folder and pick again")
+                    raise RuntimeError("that MIDI is not in the archive — reload the folder and pick again")
                 if len(names) == 1:
                     chosen = names[0]                  # only one inside → just use it
                 else:
                     bases = [n.rsplit("/", 1)[-1] for n in names]   # ask the game which one
-                    _set_job(jk, status="choices", choices=bases, choiceCount=len(bases))
-                    keep_zip = True
+                    _set_job(jk, status="choices", choices=bases, choiceCount=len(bases), archive=kind)
+                    keep_arc = True
                     return
-            with zipfile.ZipFile(zip_cache if os.path.exists(zip_cache) else src_path) as z:
-                data = z.read(chosen)
+            data = _archive_read(arc_cache if os.path.exists(arc_cache) else src_path, chosen)
             with open(midtmp, "wb") as f:
                 f.write(data)
             build_src = midtmp
@@ -281,9 +366,9 @@ def _run_job(jk, url, pick=None):
                 os.remove(p)
             except OSError:
                 pass
-        if not keep_zip:                                # only drop the zip once we're past the pick
+        if not keep_arc:                                # only drop the archive once we're past the pick
             try:
-                os.remove(zip_cache)
+                os.remove(arc_cache)
             except OSError:
                 pass
 
@@ -297,31 +382,39 @@ def _ready_payload(code):
 @app.route("/decode", methods=["GET", "POST"])
 def decode():
     # multipart upload (e.g. RAMP) — build synchronously (uploads are the user's own,
-    # usually modest; still cached by code). A .zip upload is unpacked the same way.
+    # usually modest; still cached by code). An archive upload is unpacked the same way.
     if request.method == "POST" and request.files.get("file"):
         data = request.files["file"].read()
         if not data:
             abort(400, "empty file")
         pick = request.form.get("pick")
-        if data[:2] == b"PK" and data[2:4] in _ZIP_SIGS:
+        if _archive_kind_bytes(data[:264]):
+            atmp = os.path.join(TMP_DIR, hashlib.sha1(data).hexdigest()[:16] + ".arcup")
+            with open(atmp, "wb") as f:
+                f.write(data)
             try:
-                with zipfile.ZipFile(io.BytesIO(data)) as z:
-                    names = _zip_midi_names(z)
-                    if not names:
-                        abort(400, "that zip has no .mid or .midi files in it")
-                    chosen = _resolve_pick(names, pick)
-                    if chosen is None:
-                        if pick is not None and str(pick).strip() != "":
-                            abort(400, "picked MIDI is not in the zip")
-                        if len(names) == 1:
-                            chosen = names[0]
-                        else:
-                            return jsonify({"ok": True, "status": "choices",
-                                            "choices": [n.rsplit("/", 1)[-1] for n in names],
-                                            "choiceCount": len(names)})
-                    data = z.read(chosen)
-            except zipfile.BadZipFile:
-                abort(400, "that .zip is corrupt or not a real zip")
+                try:
+                    names = _archive_list_midis(atmp)
+                except RuntimeError as e:
+                    abort(400, str(e))
+                if not names:
+                    abort(400, "that archive has no .mid or .midi files in it")
+                chosen = _resolve_pick(names, pick)
+                if chosen is None:
+                    if pick is not None and str(pick).strip() != "":
+                        abort(400, "picked MIDI is not in the archive")
+                    if len(names) == 1:
+                        chosen = names[0]
+                    else:
+                        return jsonify({"ok": True, "status": "choices",
+                                        "choices": [n.rsplit("/", 1)[-1] for n in names],
+                                        "choiceCount": len(names)})
+                data = _archive_read(atmp, chosen)
+            finally:
+                try:
+                    os.remove(atmp)
+                except OSError:
+                    pass
         code = hashlib.sha1(data).hexdigest()[:8].upper()
         if _load_header(code) is None:
             tmp = os.path.join(TMP_DIR, code + ".upload.mid")
@@ -340,7 +433,7 @@ def decode():
 
     url = request.args.get("url") or (request.is_json and (request.get_json(silent=True) or {}).get("url"))
     if not url:
-        abort(400, "provide ?url=<mid|zip>, a JSON body {\"url\":...}, or a multipart 'file'")
+        abort(400, "provide ?url=<mid|archive>, a JSON body {\"url\":...}, or a multipart 'file'")
     url = url.strip()
 
     pick = request.args.get("pick")
@@ -348,7 +441,7 @@ def decode():
         pick = (request.get_json(silent=True) or {}).get("pick")
     if pick is not None and str(pick).strip() == "":
         pick = None
-    # a pick is its own job (same zip, different chosen MIDI) so it never collides with the choices job
+    # a pick is its own job (same archive, different chosen MIDI) so it never collides with the choices job
     jk = _jobkey(url + ("\x00PICK\x00" + str(pick) if pick is not None else ""))
     j = _get_job(jk)
 
@@ -453,7 +546,8 @@ def info():
     return jsonify({
         "service": "Ro-MIDI streaming decode API",
         "format": decoder.FORMAT,
-        "flow": "GET /decode?url=<mid|zip> (poll until status=ready; a multi-MIDI zip returns status=choices — re-call with &pick=<index>) -> GET /index/<code> -> GET /chunk/<code>/<i>",
+        "archives": ["zip", "tar", "tar.gz", "tgz", "tar.bz2", "tar.xz", "7z", "rar"],
+        "flow": "GET /decode?url=<mid|archive> (poll until status=ready; a multi-MIDI archive returns status=choices — re-call with &pick=<index>) -> GET /index/<code> -> GET /chunk/<code>/<i>",
     })
 
 
