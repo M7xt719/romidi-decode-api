@@ -38,6 +38,9 @@ from decoder import _build_tempo_map, _ticks_to_seconds, REC_BYTES, FORMAT, DEFA
 SPILL = struct.Struct("<IIBBB")     # start_tick, end_tick, midi, track, vel  (11 bytes)
 SPILL_BYTES = SPILL.size
 
+# version stamp so the deployed build is verifiable at GET / (blockcap = memory-bounded assembler)
+STORE_VERSION = "blockcap-v2"
+
 # hard ceiling so a hostile/insane file can't fill the disk; env-overridable on a big instance
 MAX_NOTES = int(os.environ.get("MAX_NOTES", 600_000_000))   # 600M * 9 = ~5.4 GB on disk
 _PROGRESS_EVERY = 2_000_000
@@ -228,7 +231,7 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
     # (black-MIDI "art" stacks thousands at one instant), and loading a whole fat bucket with
     # np.fromfile is what blew past the 2 GB RAM limit and got the worker OOM-killed. We now
     # convert each bucket in fixed-size blocks so peak RAM is bounded no matter how big it is.
-    BLOCK = int(os.environ.get("ASSEMBLE_BLOCK", 1_000_000))   # ~50-90 MB peak per block
+    BLOCK = int(os.environ.get("ASSEMBLE_BLOCK", 250_000))   # ~20-40 MB peak per block (safe on a 2 GB instance)
 
     def _emit(raw, fout):
         if len(raw) == 0:
