@@ -224,28 +224,56 @@ def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
     max_end_s = 0.0
     bucket_idxs = sorted(int(fn[1:-4]) for fn in os.listdir(tmp)
                          if fn.startswith("b") and fn.endswith(".tmp"))
+    # Records-per-block cap for assembly. A single time-bucket can hold MILLIONS of notes
+    # (black-MIDI "art" stacks thousands at one instant), and loading a whole fat bucket with
+    # np.fromfile is what blew past the 2 GB RAM limit and got the worker OOM-killed. We now
+    # convert each bucket in fixed-size blocks so peak RAM is bounded no matter how big it is.
+    BLOCK = int(os.environ.get("ASSEMBLE_BLOCK", 1_000_000))   # ~50-90 MB peak per block
+
+    def _emit(raw, fout):
+        if len(raw) == 0:
+            return 0.0
+        st = raw["st"].astype(np.int64)
+        et = raw["et"].astype(np.int64)
+        ss = _ticks_to_seconds(st, bt, cum, tp, tpb, smpte, tps)
+        ee = _ticks_to_seconds(et, bt, cum, tp, tpb, smpte, tps)
+        out = np.empty(len(raw), dtype=dt)
+        sm = np.floor(ss * 1000.0 + 0.5); np.clip(sm, 0, 0xFFFFFFFF, out=sm)
+        out["s"] = sm.astype(np.uint32)
+        dd = np.floor((ee - ss) * 1000.0 + 0.5); np.clip(dd, 1, 65535, out=dd)
+        out["d"] = dd.astype(np.uint16)
+        out["m"] = raw["m"]; out["t"] = raw["t"]; out["v"] = raw["v"]
+        out.sort(order="s", kind="stable")
+        fout.write(out.tobytes())
+        return float(ee.max())
+
     with open(final_path, "wb") as fout:
         for bi in bucket_idxs:
             bp = os.path.join(tmp, "b%010d.tmp" % bi)
-            raw = np.fromfile(bp, dtype=spill_dt)
-            os.remove(bp)
-            if len(raw) == 0:
+            nrec = os.path.getsize(bp) // SPILL_BYTES
+            if nrec == 0:
+                os.remove(bp)
                 continue
-            st = raw["st"].astype(np.int64)
-            et = raw["et"].astype(np.int64)
-            ss = _ticks_to_seconds(st, bt, cum, tp, tpb, smpte, tps)
-            ee = _ticks_to_seconds(et, bt, cum, tp, tpb, smpte, tps)
-            out = np.empty(len(raw), dtype=dt)
-            sm = np.floor(ss * 1000.0 + 0.5); np.clip(sm, 0, 0xFFFFFFFF, out=sm)
-            out["s"] = sm.astype(np.uint32)
-            dd = np.floor((ee - ss) * 1000.0 + 0.5); np.clip(dd, 1, 65535, out=dd)
-            out["d"] = dd.astype(np.uint16)
-            out["m"] = raw["m"]; out["t"] = raw["t"]; out["v"] = raw["v"]
-            out.sort(order="s", kind="stable")
-            fout.write(out.tobytes())
-            m = float(ee.max())
-            if m > max_end_s:
-                max_end_s = m
+            if nrec <= BLOCK:
+                raw = np.fromfile(bp, dtype=spill_dt)   # normal bucket: whole + fully sorted (unchanged)
+                os.remove(bp)
+                m = _emit(raw, fout)
+                if m > max_end_s:
+                    max_end_s = m
+            else:
+                # oversized bucket = a dense same-instant stack. Its records share (near-)identical
+                # start times, so streaming it block-by-block keeps the schedule correct while the
+                # per-block sort still orders within each block — and RAM stays flat.
+                with open(bp, "rb") as bf:
+                    while True:
+                        chunk = bf.read(BLOCK * SPILL_BYTES)
+                        if not chunk:
+                            break
+                        raw = np.frombuffer(chunk, dtype=spill_dt)
+                        m = _emit(raw, fout)
+                        if m > max_end_s:
+                            max_end_s = m
+                os.remove(bp)
     try:
         os.rmdir(tmp)
     except OSError:
