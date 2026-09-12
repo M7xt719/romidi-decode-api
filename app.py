@@ -1,560 +1,311 @@
 """
-Ro-MIDI streaming decode API  (v2 — windowed / disk-backed)
+Ro-MIDI streaming STORE builder — turns any-size .mid into an on-disk, globally
+sorted, chunk-indexed schedule using flat (bounded) memory, so massive black
+MIDIs (up to hundreds of millions of notes) can be built on modest hardware and
+then STREAMED to the game a time-window at a time.
 
-Turns any-size .mid into an on-disk, globally sorted, chunk-indexed schedule and
-serves it to the game one time-window at a time, so massive black MIDIs (up to
-BILLIONS of notes) can be streamed without ever holding the whole song in memory
-— on the server OR in Roblox.
+Pipeline (RAM stays flat regardless of file size):
+  1. mmap the source .mid (never read the whole file into RAM).
+  2. Parse note events; spill each note as an 11-byte tick-record into a
+     per-time-bucket file on disk (a small LRU of open handles). Collect tempo
+     events (tiny).
+  3. Assemble: walk the bucket files in time order; for each bucket convert
+     ticks->ms with numpy, sort within the bucket, append 9-byte records to the
+     final schedule (sched.bin). Buckets in ascending time order => the whole
+     file is globally sorted by start time.
+  4. Build a chunk index (first start-ms of every notesPerChunk records) so the
+     game knows which chunk covers which moment and can fetch on demand.
 
-Big files are parsed ONCE in a background process and cached by their content
-"code" (sha1 of the file). The game polls /decode until status == "ready", then
-fetches /index once and pulls /chunk/<code>/<i> on demand as the playhead moves.
+Output files in out_dir:
+  sched.bin    — the packed schedule: N * 9-byte records (romidi-sched-v1)
+  index.bin    — chunkCount * u32 little-endian: first start_ms of each chunk
+  header.json  — {format,noteCount,durationMs,trackCount,recordBytes,notesPerChunk,chunkCount,code,trackNames,trackNotes}
 
-ARCHIVE "folders": /decode also accepts a link to an archive of MIDIs —
-  .zip · .tar/.tar.gz/.tgz/.tar.bz2/.tar.xz · .7z · .rar
-The server opens it and finds the .mid/.midi inside. ONE MIDI -> it just decodes
-that one. SEVERAL -> it replies status == "choices" with the list of names so the
-game can ask which one; the game re-calls /decode with &pick=<index> to pull it.
-(.zip and .tar* work everywhere; .7z needs the py7zr package; .rar needs an
-extractor binary — 'unar' — installed in the image. See requirements/Dockerfile.)
-
-Endpoints (all the game needs are GETs, each response well under Roblox's ~1 MB):
-  GET  /                       -> service info
-  GET  /health                 -> {"ok": true}
-  GET  /decode?url=<mid-url>    -> START (or poll) an async build; returns {status,...}
-  GET  /decode?url=<arc>&pick=N -> extract MIDI #N (0-based) from an archive folder
-  POST /decode                 -> body {"url": "..."} OR multipart file "file" (.mid or an archive)
-  GET  /status/<job>           -> job status by job id (alt to polling /decode)
-  GET  /header/<code>          -> the cached header JSON (incl. chunkCount)
-  GET  /index/<code>           -> raw u32[chunkCount] little-endian: first start_ms of each chunk
-  GET  /chunk/<code>/<i>       -> raw bytes of chunk i (application/octet-stream)
-
-Status values: starting -> downloading -> queued -> parsing -> assembling -> ready
-(or error, or choices). "code" appears once the source is hashed; the full header
-once ready; "choices" carries a list of MIDI names when an archive holds >1.
+sched.bin is the SAME 9-byte record format the game already reads, so a "chunk"
+is just sched.bin[i*notesPerChunk*9 : (i+1)*notesPerChunk*9].
 """
 
 import os
-import re
-import io
-import sys
 import json
-import time
-import shutil
-import zipfile
-import tarfile
-import hashlib
-import threading
-import subprocess
+import struct
+import mmap
+from collections import OrderedDict
 
-import requests
-from flask import Flask, request, jsonify, Response, abort
+import numpy as np
 
-import decoder            # for FORMAT + the in-memory path (small uploads)
-import store as store_mod
+from decoder import _build_tempo_map, _ticks_to_seconds, REC_BYTES, FORMAT, DEFAULT_NOTES_PER_CHUNK
 
-app = Flask(__name__)
+SPILL = struct.Struct("<IIBBB")     # start_tick, end_tick, midi, track, vel  (11 bytes)
+SPILL_BYTES = SPILL.size
 
-# CACHE_DIR should point at a PERSISTENT disk on the host (Render disk mount),
-# so parsed schedules survive restarts/redeploys and are reused forever.
-CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache"))
-TMP_DIR = os.path.join(CACHE_DIR, "_tmp")
-URLMAP_DIR = os.path.join(CACHE_DIR, "_urlmap")
-for _d in (CACHE_DIR, TMP_DIR, URLMAP_DIR):
-    os.makedirs(_d, exist_ok=True)
+# version stamp so the deployed build is verifiable at GET / (blockcap = memory-bounded assembler)
+STORE_VERSION = "blockcap-v2"
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", 6 * 1024 * 1024 * 1024))  # 6 GB
-FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", 180))
-CODE_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
-
-_JOBS = {}                       # jobkey -> status dict
-_JOBS_LOCK = threading.Lock()
-_BUILD_LOCK = threading.Lock()   # only one heavy build at a time (disk + CPU safety)
+# hard ceiling so a hostile/insane file can't fill the disk; env-overridable on a big instance
+MAX_NOTES = int(os.environ.get("MAX_NOTES", 600_000_000))   # 600M * 9 = ~5.4 GB on disk
+_PROGRESS_EVERY = 2_000_000
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-def _store_dir(code):
-    return os.path.join(CACHE_DIR, code.upper())
+def _read_vlq(mv, pos):
+    v = 0
+    while True:
+        b = mv[pos]
+        pos += 1
+        v = (v << 7) | (b & 0x7F)
+        if not (b & 0x80):
+            return v, pos
 
 
-def _load_header(code):
-    if not code:
-        return None
-    hp = os.path.join(_store_dir(code), "header.json")
-    if os.path.exists(hp):
-        try:
-            with open(hp) as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return None
-    return None
+class _Buckets:
+    """Append-only writers for time-bucket spill files, with a bounded set of
+    open file handles (LRU) so a very long song can't blow the fd limit."""
 
+    def __init__(self, d, max_open=200):
+        self.d = d
+        self.max_open = max_open
+        self.handles = OrderedDict()   # bucket_idx -> open file
 
-def _jobkey(url):
-    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    def _path(self, b):
+        return os.path.join(self.d, "b%010d.tmp" % b)
 
-
-def _set_job(jk, **kw):
-    with _JOBS_LOCK:
-        j = _JOBS.get(jk) or {}
-        j.update(kw)
-        j["updated"] = time.time()
-        _JOBS[jk] = j
-        return dict(j)
-
-
-def _get_job(jk):
-    with _JOBS_LOCK:
-        return dict(_JOBS.get(jk) or {})
-
-
-def _sha1_file(path):
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        for part in iter(lambda: f.read(1 << 20), b""):
-            h.update(part)
-    return h.hexdigest()
-
-
-# ── archive support (zip · tar* · 7z · rar) ──────────────────────────
-_ZIP_SIGS = (b"\x03\x04", b"\x05\x06", b"\x07\x08")
-
-
-def _archive_kind_bytes(head):
-    """Classify an archive from its first bytes: 'zip' | 'rar' | '7z' | 'tar' | None."""
-    if head[:2] == b"PK" and head[2:4] in _ZIP_SIGS:
-        return "zip"
-    if head[:4] == b"Rar!":                       # Rar!\x1a\x07\x00 (v4) / \x01\x00 (v5)
-        return "rar"
-    if head[:6] == b"7z\xbc\xaf\x27\x1c":
-        return "7z"
-    if head[:2] == b"\x1f\x8b":                   # gzip → treat as .tar.gz (tarfile r:* auto-detects)
-        return "tar"
-    if head[:3] == b"BZh":                        # bzip2 → .tar.bz2
-        return "tar"
-    if head[:6] == b"\xfd7zXZ\x00":               # xz → .tar.xz
-        return "tar"
-    if len(head) >= 262 and head[257:262] == b"ustar":   # plain tar
-        return "tar"
-    return None
-
-
-def _archive_kind(path):
-    try:
-        with open(path, "rb") as f:
-            head = f.read(264)
-    except OSError:
-        return None
-    return _archive_kind_bytes(head)
-
-
-def _keep_midi(name):
-    base = name.rsplit("/", 1)[-1]
-    if not base or base.startswith("._"):
-        return False
-    if name.startswith("__MACOSX/") or "/__MACOSX/" in name:
-        return False
-    return base.lower().endswith((".mid", ".midi"))
-
-
-def _sorted_midis(names):
-    out = [n for n in names if _keep_midi(n)]
-    out.sort(key=str.lower)
-    return out
-
-
-def _open_rar(path):
-    try:
-        import rarfile
-    except ImportError:
-        raise RuntimeError(".rar support isn't installed on this server build (add 'rarfile' + 'unar')")
-    try:
-        rarfile.tool_setup()   # probes for unrar/unar/bsdtar/7z; raises if none present
-    except Exception:
-        raise RuntimeError(".rar needs an extractor on the server — install 'unar' in the Docker image")
-    try:
-        return rarfile.RarFile(path)
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError("couldn't open that .rar (%s)" % e.__class__.__name__)
-
-
-def _archive_list_midis(path):
-    """Sorted list of the .mid/.midi entries in the archive at `path`, or None if it isn't one."""
-    kind = _archive_kind(path)
-    if kind == "zip":
-        with zipfile.ZipFile(path) as z:
-            return _sorted_midis(i.filename for i in z.infolist() if not i.is_dir())
-    if kind == "tar":
-        try:
-            with tarfile.open(path, "r:*") as t:
-                return _sorted_midis(m.name for m in t.getmembers() if m.isfile())
-        except tarfile.TarError as e:
-            raise RuntimeError("couldn't read that tar archive (%s)" % e.__class__.__name__)
-    if kind == "7z":
-        try:
-            import py7zr
-        except ImportError:
-            raise RuntimeError(".7z support isn't installed on this server build (add 'py7zr')")
-        with py7zr.SevenZipFile(path, "r") as a:
-            return _sorted_midis(fi.filename for fi in a.list() if not fi.is_directory)
-    if kind == "rar":
-        rf = _open_rar(path)
-        return _sorted_midis(i.filename for i in rf.infolist() if not i.isdir())
-    return None
-
-
-def _archive_read(path, name):
-    """Bytes of one entry `name` from the archive at `path`."""
-    kind = _archive_kind(path)
-    if kind == "zip":
-        with zipfile.ZipFile(path) as z:
-            return z.read(name)
-    if kind == "tar":
-        with tarfile.open(path, "r:*") as t:
-            f = t.extractfile(name)
-            if f is None:
-                raise RuntimeError("couldn't extract '%s' from the tar" % name)
-            return f.read()
-    if kind == "7z":
-        import py7zr
-        with py7zr.SevenZipFile(path, "r") as a:
-            got = a.read([name])
-            bio = got.get(name)
-            if bio is None:
-                raise RuntimeError("couldn't extract '%s' from the 7z" % name)
-            return bio.read()
-    if kind == "rar":
-        rf = _open_rar(path)
-        return rf.read(name)
-    raise RuntimeError("not a recognised archive")
-
-
-def _resolve_pick(names, pick):
-    """pick may be a 0-based index (as str/int) or a filename; returns the matching entry or None."""
-    if pick is None:
-        return None
-    s = str(pick).strip()
-    if s == "":
-        return None
-    if s.isdigit():
-        idx = int(s)
-        return names[idx] if 0 <= idx < len(names) else None
-    for n in names:
-        if n == s or n.rsplit("/", 1)[-1] == s:
-            return n
-    return None
-
-
-def _download(url, dst, jk):
-    if not re.match(r"^https?://", url, re.I):
-        raise ValueError("url must be http(s)")
-    h = hashlib.sha1()
-    total = 0
-    with requests.get(url, stream=True, timeout=FETCH_TIMEOUT,
-                      headers={"User-Agent": "RoMIDI-Decoder/2"}) as r:
-        r.raise_for_status()
-        with open(dst, "wb") as f:
-            for part in r.iter_content(1 << 20):
-                if not part:
-                    continue
-                total += len(part)
-                if total > MAX_DOWNLOAD_BYTES:
-                    raise ValueError("source exceeds the %d-byte download limit" % MAX_DOWNLOAD_BYTES)
-                h.update(part)
-                f.write(part)
-                _set_job(jk, status="downloading", bytes=total)
-    if total == 0:
-        raise ValueError("downloaded 0 bytes")
-    return h.hexdigest()[:8].upper()
-
-
-def _run_job(jk, url, pick=None):
-    url_jk = _jobkey(url)                              # archive cache is keyed by URL (shared across picks)
-    tmp = os.path.join(TMP_DIR, jk + ".src")           # the raw download (mid OR archive)
-    midtmp = os.path.join(TMP_DIR, jk + ".mid")        # a MIDI extracted from an archive
-    arc_cache = os.path.join(TMP_DIR, url_jk + ".arcsrc")  # kept between the "choices" reply and the pick
-    keep_arc = False
-    try:
-        # get the source bytes — reuse a cached archive on a follow-up pick so we don't re-download it
-        if pick is not None and os.path.exists(arc_cache):
-            src_path, dl_code = arc_cache, None
+    def write(self, b, data):
+        h = self.handles.get(b)
+        if h is None:
+            if len(self.handles) >= self.max_open:
+                _, old = self.handles.popitem(last=False)
+                old.close()
+            h = open(self._path(b), "ab", buffering=1 << 16)
+            self.handles[b] = h
         else:
-            _set_job(jk, status="downloading", bytes=0)
-            dl_code = _download(url, tmp, jk)
-            src_path = tmp
+            self.handles.move_to_end(b)
+        h.write(data)
 
-        kind = _archive_kind(src_path)
-        if kind:
-            # a "folder" of MIDIs — find them
-            names = _archive_list_midis(src_path)
-            if not names:
-                raise RuntimeError("that %s has no .mid or .midi files in it" % kind)
-            # keep the archive so a follow-up &pick doesn't have to download it again
-            if src_path != arc_cache:
-                try:
-                    shutil.copyfile(src_path, arc_cache)
-                except OSError:
-                    pass
-            chosen = _resolve_pick(names, pick)
-            if chosen is None:
-                if pick is not None and str(pick).strip() != "":
-                    raise RuntimeError("that MIDI is not in the archive — reload the folder and pick again")
-                if len(names) == 1:
-                    chosen = names[0]                  # only one inside → just use it
+    def close(self):
+        for h in self.handles.values():
+            h.close()
+        self.handles.clear()
+
+
+def build_store(src_path, out_dir, code, bucket_beats=4, progress=None):
+    """Build the on-disk store for the .mid at src_path into out_dir. Returns the header dict."""
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = os.path.join(out_dir, "_buckets")
+    os.makedirs(tmp, exist_ok=True)
+
+    with open(src_path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    mv = memoryview(mm)
+    n = len(mv)
+    try:
+        if n < 14 or bytes(mv[0:4]) != b"MThd":
+            raise ValueError("not a MIDI file (missing MThd header)")
+        _, _, division = struct.unpack(">HHH", bytes(mv[8:14]))
+        if division & 0x8000:
+            frames = 256 - (division >> 8)
+            subframes = division & 0xFF
+            tps = max(1, frames * subframes)
+            smpte, tpb = True, 1
+        else:
+            smpte, tps = False, 1
+            tpb = division or 480
+        bucket_ticks = max(1, tpb * bucket_beats)
+
+        buckets = _Buckets(tmp)
+        pack = SPILL.pack
+        tempo_ticks, tempo_vals = [], []
+        note_total = 0
+        last_prog = 0
+        track_index = -1
+        track_names = {}   # track_index -> name (from FF 03 meta)
+        track_notes = {}   # track byte (0..255) -> note count
+
+        pos = 0
+        while pos + 8 <= n:
+            cid = bytes(mv[pos:pos + 4])
+            length = int.from_bytes(mv[pos + 4:pos + 8], "big")
+            body_start = pos + 8
+            body_end = min(n, body_start + length)
+            pos = body_start + length
+            if cid != b"MTrk":
+                continue
+            track_index += 1
+            tclamp = track_index if track_index < 255 else 255
+            p = body_start
+            abs_tick = 0
+            status = 0
+            active = {}
+            while p < body_end:
+                delta, p = _read_vlq(mv, p)
+                abs_tick += delta
+                if p >= body_end:
+                    break
+                b = mv[p]
+                if b & 0x80:
+                    status = b
+                    p += 1
+                    if b == 0xFF:
+                        mtype = mv[p]
+                        p += 1
+                        length2, p = _read_vlq(mv, p)
+                        if mtype == 0x51 and length2 == 3:
+                            tempo_ticks.append(abs_tick)
+                            tempo_vals.append((mv[p] << 16) | (mv[p + 1] << 8) | mv[p + 2])
+                            p += length2
+                        elif mtype == 0x03:
+                            seg = bytes(mv[p:p + length2])
+                            p += length2
+                            if track_index not in track_names:
+                                nm = seg.decode("utf-8", "ignore").replace("\x00", "").strip()
+                                if nm:
+                                    track_names[track_index] = nm[:48]
+                        elif mtype == 0x2F:
+                            p += length2
+                            break
+                        else:
+                            p += length2
+                        status = 0
+                        continue
+                    if b == 0xF0 or b == 0xF7:
+                        length2, p = _read_vlq(mv, p)
+                        p += length2
+                        status = 0
+                        continue
                 else:
-                    bases = [n.rsplit("/", 1)[-1] for n in names]   # ask the game which one
-                    _set_job(jk, status="choices", choices=bases, choiceCount=len(bases), archive=kind)
-                    keep_arc = True
-                    return
-            data = _archive_read(arc_cache if os.path.exists(arc_cache) else src_path, chosen)
-            with open(midtmp, "wb") as f:
-                f.write(data)
-            build_src = midtmp
-            code = _sha1_file(build_src)[:8].upper()
-            _set_job(jk, status="queued", code=code, pickedName=chosen.rsplit("/", 1)[-1])
-        else:
-            build_src = src_path                        # a plain .mid
-            code = dl_code or _sha1_file(build_src)[:8].upper()
-            _set_job(jk, status="queued", code=code)
-
-        with _BUILD_LOCK:
-            hdr = _load_header(code)
-            if hdr is None:
-                out_dir = _store_dir(code)
-                os.makedirs(out_dir, exist_ok=True)
-                _set_job(jk, status="parsing", code=code, noteCount=0)
-                proc = subprocess.Popen(
-                    [sys.executable, os.path.join(APP_DIR, "build_worker.py"), build_src, out_dir, code],
-                    cwd=APP_DIR,
-                )
-                pf = os.path.join(out_dir, "progress.json")
-                while proc.poll() is None:
-                    time.sleep(0.5)
-                    try:
-                        with open(pf) as f:
-                            pr = json.load(f)
-                        ph = pr.get("phase", "parsing")
-                        _set_job(jk, status=("assembling" if ph == "ready" else ph),
-                                 code=code, noteCount=max(0, pr.get("notes", 0)))
-                    except (OSError, ValueError):
-                        pass
-                if proc.returncode != 0:
-                    err = "parse failed"
-                    ep = os.path.join(out_dir, "error.txt")
-                    if os.path.exists(ep):
-                        err = open(ep).read().strip() or err
-                    raise RuntimeError(err)
-                hdr = _load_header(code)
-                if hdr is None:
-                    raise RuntimeError("build finished but no header was written")
-
-            try:
-                with open(os.path.join(URLMAP_DIR, jk), "w") as f:
-                    f.write(code)
-            except OSError:
-                pass
-
-        _set_job(jk, status="ready", code=code, noteCount=hdr["noteCount"],
-                 chunkCount=hdr["chunkCount"], durationMs=hdr["durationMs"],
-                 trackCount=hdr["trackCount"])
-    except Exception as e:  # noqa: BLE001
-        _set_job(jk, status="error", err=str(e))
-    finally:
-        for p in (tmp, midtmp):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        if not keep_arc:                                # only drop the archive once we're past the pick
-            try:
-                os.remove(arc_cache)
-            except OSError:
-                pass
-
-
-def _ready_payload(code):
-    hdr = _load_header(code) or {}
-    return {"ok": True, "status": "ready", **hdr}
-
-
-# ── routes ───────────────────────────────────────────────────────────
-@app.route("/decode", methods=["GET", "POST"])
-def decode():
-    # multipart upload (e.g. RAMP) — build synchronously (uploads are the user's own,
-    # usually modest; still cached by code). An archive upload is unpacked the same way.
-    if request.method == "POST" and request.files.get("file"):
-        data = request.files["file"].read()
-        if not data:
-            abort(400, "empty file")
-        pick = request.form.get("pick")
-        if _archive_kind_bytes(data[:264]):
-            atmp = os.path.join(TMP_DIR, hashlib.sha1(data).hexdigest()[:16] + ".arcup")
-            with open(atmp, "wb") as f:
-                f.write(data)
-            try:
-                try:
-                    names = _archive_list_midis(atmp)
-                except RuntimeError as e:
-                    abort(400, str(e))
-                if not names:
-                    abort(400, "that archive has no .mid or .midi files in it")
-                chosen = _resolve_pick(names, pick)
-                if chosen is None:
-                    if pick is not None and str(pick).strip() != "":
-                        abort(400, "picked MIDI is not in the archive")
-                    if len(names) == 1:
-                        chosen = names[0]
+                    if status == 0 or status >= 0xF0:
+                        p += 1
+                        continue
+                hi = status & 0xF0
+                chan = status & 0x0F
+                if hi == 0x90:
+                    note = mv[p]; vel = mv[p + 1]; p += 2
+                    if vel > 0:
+                        active[(chan, note)] = (abs_tick, vel)
                     else:
-                        return jsonify({"ok": True, "status": "choices",
-                                        "choices": [n.rsplit("/", 1)[-1] for n in names],
-                                        "choiceCount": len(names)})
-                data = _archive_read(atmp, chosen)
-            finally:
-                try:
-                    os.remove(atmp)
-                except OSError:
-                    pass
-        code = hashlib.sha1(data).hexdigest()[:8].upper()
-        if _load_header(code) is None:
-            tmp = os.path.join(TMP_DIR, code + ".upload.mid")
-            with open(tmp, "wb") as f:
-                f.write(data)
-            try:
-                with _BUILD_LOCK:
-                    if _load_header(code) is None:
-                        store_mod.build_store(tmp, _store_dir(code), code)
-            finally:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        return jsonify(_ready_payload(code))
+                        onv = active.pop((chan, note), None)
+                        if onv is not None:
+                            buckets.write(onv[0] // bucket_ticks,
+                                          pack(onv[0], abs_tick, note & 0x7F, tclamp, onv[1] if onv[1] <= 127 else 127))
+                            note_total += 1
+                            track_notes[tclamp] = track_notes.get(tclamp, 0) + 1
+                elif hi == 0x80:
+                    note = mv[p]; p += 2
+                    onv = active.pop((chan, note), None)
+                    if onv is not None:
+                        buckets.write(onv[0] // bucket_ticks,
+                                      pack(onv[0], abs_tick, note & 0x7F, tclamp, onv[1] if onv[1] <= 127 else 127))
+                        note_total += 1
+                        track_notes[tclamp] = track_notes.get(tclamp, 0) + 1
+                elif hi == 0xA0 or hi == 0xB0 or hi == 0xE0:
+                    p += 2
+                else:
+                    p += 1
+                if note_total - last_prog >= _PROGRESS_EVERY:
+                    last_prog = note_total
+                    if progress:
+                        progress("parsing", note_total)
+                    if note_total > MAX_NOTES:
+                        raise ValueError("MIDI too large (over %d notes)" % MAX_NOTES)
+            if active:
+                for (chan, note), (start_tick, vel) in active.items():
+                    buckets.write(start_tick // bucket_ticks,
+                                  pack(start_tick, abs_tick, note & 0x7F, tclamp, vel if vel <= 127 else 127))
+                    note_total += 1
+                    track_notes[tclamp] = track_notes.get(tclamp, 0) + 1
+        buckets.close()
+    finally:
+        mv.release()
+        mm.close()
 
-    url = request.args.get("url") or (request.is_json and (request.get_json(silent=True) or {}).get("url"))
-    if not url:
-        abort(400, "provide ?url=<mid|archive>, a JSON body {\"url\":...}, or a multipart 'file'")
-    url = url.strip()
+    track_count = track_index + 1 if track_index >= 0 else 0
+    bt, cum, tp = _build_tempo_map(tempo_ticks, tempo_vals, tpb)
 
-    pick = request.args.get("pick")
-    if pick is None and request.is_json:
-        pick = (request.get_json(silent=True) or {}).get("pick")
-    if pick is not None and str(pick).strip() == "":
-        pick = None
-    # a pick is its own job (same archive, different chosen MIDI) so it never collides with the choices job
-    jk = _jobkey(url + ("\x00PICK\x00" + str(pick) if pick is not None else ""))
-    j = _get_job(jk)
+    final_path = os.path.join(out_dir, "sched.bin")
+    dt = np.dtype([("s", "<u4"), ("d", "<u2"), ("m", "u1"), ("t", "u1"), ("v", "u1")])
+    spill_dt = np.dtype([("st", "<u4"), ("et", "<u4"), ("m", "u1"), ("t", "u1"), ("v", "u1")])
+    assert dt.itemsize == REC_BYTES and spill_dt.itemsize == SPILL_BYTES
 
-    if j.get("status") == "ready" and _load_header(j.get("code")):
-        return jsonify(_ready_payload(j["code"]))
+    max_end_s = 0.0
+    bucket_idxs = sorted(int(fn[1:-4]) for fn in os.listdir(tmp)
+                         if fn.startswith("b") and fn.endswith(".tmp"))
+    # Records-per-block cap for assembly. A single time-bucket can hold MILLIONS of notes
+    # (black-MIDI "art" stacks thousands at one instant), and loading a whole fat bucket with
+    # np.fromfile is what blew past the 2 GB RAM limit and got the worker OOM-killed. We now
+    # convert each bucket in fixed-size blocks so peak RAM is bounded no matter how big it is.
+    BLOCK = int(os.environ.get("ASSEMBLE_BLOCK", 250_000))   # ~20-40 MB peak per block (safe on a 2 GB instance)
 
-    if j.get("status") == "choices":
-        return jsonify({"ok": True, "status": "choices", "job": jk,
-                        "choices": j.get("choices", []), "choiceCount": j.get("choiceCount", 0)})
+    def _emit(raw, fout):
+        if len(raw) == 0:
+            return 0.0
+        st = raw["st"].astype(np.int64)
+        et = raw["et"].astype(np.int64)
+        ss = _ticks_to_seconds(st, bt, cum, tp, tpb, smpte, tps)
+        ee = _ticks_to_seconds(et, bt, cum, tp, tpb, smpte, tps)
+        out = np.empty(len(raw), dtype=dt)
+        sm = np.floor(ss * 1000.0 + 0.5); np.clip(sm, 0, 0xFFFFFFFF, out=sm)
+        out["s"] = sm.astype(np.uint32)
+        dd = np.floor((ee - ss) * 1000.0 + 0.5); np.clip(dd, 1, 65535, out=dd)
+        out["d"] = dd.astype(np.uint16)
+        out["m"] = raw["m"]; out["t"] = raw["t"]; out["v"] = raw["v"]
+        out.sort(order="s", kind="stable")
+        fout.write(out.tobytes())
+        return float(ee.max())
 
-    # resume a cached result by URL after a restart (in-memory job map is gone,
-    # but the store on the persistent disk isn't)
-    if not j:
-        mp = os.path.join(URLMAP_DIR, jk)
-        if os.path.exists(mp):
-            try:
-                code = open(mp).read().strip()
-            except OSError:
-                code = ""
-            hdr = _load_header(code)
-            if hdr:
-                _set_job(jk, status="ready", code=code, noteCount=hdr["noteCount"],
-                         chunkCount=hdr["chunkCount"], durationMs=hdr["durationMs"],
-                         trackCount=hdr["trackCount"])
-                return jsonify(_ready_payload(code))
-
-    if j.get("status") in ("starting", "downloading", "queued", "parsing", "assembling"):
-        return jsonify({"ok": True, "status": j["status"], "job": jk,
-                        "bytes": j.get("bytes", 0), "noteCount": j.get("noteCount", 0),
-                        "code": j.get("code")})
-
-    if j.get("status") == "error":
-        # allow a retry by clearing and restarting
+    with open(final_path, "wb") as fout:
+        for bi in bucket_idxs:
+            bp = os.path.join(tmp, "b%010d.tmp" % bi)
+            nrec = os.path.getsize(bp) // SPILL_BYTES
+            if nrec == 0:
+                os.remove(bp)
+                continue
+            if nrec <= BLOCK:
+                raw = np.fromfile(bp, dtype=spill_dt)   # normal bucket: whole + fully sorted (unchanged)
+                os.remove(bp)
+                m = _emit(raw, fout)
+                if m > max_end_s:
+                    max_end_s = m
+            else:
+                # oversized bucket = a dense same-instant stack. Its records share (near-)identical
+                # start times, so streaming it block-by-block keeps the schedule correct while the
+                # per-block sort still orders within each block — and RAM stays flat.
+                with open(bp, "rb") as bf:
+                    while True:
+                        chunk = bf.read(BLOCK * SPILL_BYTES)
+                        if not chunk:
+                            break
+                        raw = np.frombuffer(chunk, dtype=spill_dt)
+                        m = _emit(raw, fout)
+                        if m > max_end_s:
+                            max_end_s = m
+                os.remove(bp)
+    try:
+        os.rmdir(tmp)
+    except OSError:
         pass
 
-    _set_job(jk, status="starting", bytes=0, noteCount=0)
-    threading.Thread(target=_run_job, args=(jk, url, pick), daemon=True).start()
-    return jsonify({"ok": True, "status": "starting", "job": jk})
+    chunk_count = (note_total + DEFAULT_NOTES_PER_CHUNK - 1) // DEFAULT_NOTES_PER_CHUNK
+    index = np.zeros(max(chunk_count, 0), dtype="<u4")
+    if chunk_count:
+        with open(final_path, "rb") as fin:
+            step = DEFAULT_NOTES_PER_CHUNK * REC_BYTES
+            for i in range(chunk_count):
+                fin.seek(i * step)
+                b4 = fin.read(4)
+                if len(b4) == 4:
+                    index[i] = struct.unpack("<I", b4)[0]
+    index.tofile(os.path.join(out_dir, "index.bin"))
 
-
-@app.get("/status/<job>")
-def status(job):
-    j = _get_job(job)
-    if not j:
-        return jsonify({"ok": False, "status": "unknown"}), 404
-    out = {"ok": True, "status": j.get("status"), "bytes": j.get("bytes", 0),
-           "noteCount": j.get("noteCount", 0)}
-    if j.get("code"):
-        out["code"] = j["code"]
-    if j.get("status") == "choices":
-        out["choices"] = j.get("choices", [])
-        out["choiceCount"] = j.get("choiceCount", 0)
-    if j.get("status") == "ready":
-        out.update(_load_header(j["code"]) or {})
-    if j.get("status") == "error":
-        out["err"] = j.get("err")
-    return jsonify(out)
-
-
-@app.get("/header/<code>")
-def header(code):
-    if not CODE_RE.match(code):
-        abort(400, "bad code")
-    hdr = _load_header(code.upper())
-    if not hdr:
-        abort(404, "unknown code")
-    return jsonify({"ok": True, **hdr})
-
-
-@app.get("/index/<code>")
-def index_route(code):
-    if not CODE_RE.match(code):
-        abort(400, "bad code")
-    p = os.path.join(_store_dir(code.upper()), "index.bin")
-    if not os.path.exists(p):
-        abort(404, "unknown code")
-    with open(p, "rb") as f:
-        data = f.read()
-    return Response(data, mimetype="application/octet-stream")
-
-
-@app.get("/chunk/<code>/<int:i>")
-def chunk(code, i):
-    if not CODE_RE.match(code):
-        abort(400, "bad code")
-    hdr = _load_header(code.upper())
-    if not hdr:
-        abort(404, "unknown code")
-    step = hdr["notesPerChunk"] * hdr["recordBytes"]
-    p = os.path.join(_store_dir(code.upper()), "sched.bin")
-    if not os.path.exists(p):
-        abort(404, "no schedule")
-    with open(p, "rb") as f:
-        f.seek(i * step)
-        blob = f.read(step)
-    return Response(blob, mimetype="application/octet-stream",
-                    headers={"X-Chunk": str(i), "X-Chunk-Count": str(hdr["chunkCount"])})
-
-
-@app.get("/")
-def info():
-    return jsonify({
-        "service": "Ro-MIDI streaming decode API",
-        "format": decoder.FORMAT,
-        "archives": ["zip", "tar", "tar.gz", "tgz", "tar.bz2", "tar.xz", "7z", "rar"],
-        "flow": "GET /decode?url=<mid|archive> (poll until status=ready; a multi-MIDI archive returns status=choices — re-call with &pick=<index>) -> GET /index/<code> -> GET /chunk/<code>/<i>",
-    })
-
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
+    _ntr = min(track_count, 512)
+    track_names_list = [track_names.get(i, "") for i in range(_ntr)]
+    track_notes_list = [int(track_notes.get(i, 0)) for i in range(_ntr)]
+    header = {
+        "format": FORMAT, "noteCount": note_total,
+        "durationMs": int(max_end_s * 1000 + 0.5),
+        "trackCount": track_count, "recordBytes": REC_BYTES,
+        "notesPerChunk": DEFAULT_NOTES_PER_CHUNK, "chunkCount": chunk_count, "code": code,
+        "trackNames": track_names_list, "trackNotes": track_notes_list,
+    }
+    with open(os.path.join(out_dir, "header.json"), "w") as f:
+        json.dump(header, f)
+    if progress:
+        progress("ready", note_total)
+    return header
